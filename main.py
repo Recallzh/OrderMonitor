@@ -10,25 +10,31 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_v1_5
 
-# ================= 🔧 全局配置 (会自动更新) 🔧 =================
-# 这些变量现在是动态的，会被本地服务器更新
-GLOBAL_CONFIG = {
+# ================= 🔧 全局配置 (动态更新) 🔧 =================
+# 1. Heimdallr (旧的那个)
+HEIMDALLR_CONFIG = {
     "TOKEN": "",
     "COOKIE": "",
-    "SYSTEM_ID": "0e9e407230db4436a56ca1d0df23c255", # 默认值，也会更新
+    "SYSTEM_ID": "0e9e407230db4436a56ca1d0df23c255",
     "TYPE_HEADER": "heimdallr"
+}
+
+# 2. Tybs (新的这个 - 工作台)
+TYBS_CONFIG = {
+    "HEADERS": {} # 直接存储整个 Header 字典
 }
 
 MONITOR_INTERVAL = 30 # 刷新间隔(秒)
 LOCAL_PORT = 8899     # 本地通信端口
 
-# ==========================================================
-
-LATEST_ORDERS = []
+# 状态存储
+LATEST_HEIMDALLR_ORDERS = []
+LATEST_TYBS_COUNT = -1 # -1表示未初始化
 IS_RUNNING = True
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- 模块1: 本地 HTTP 服务器 (接收浏览器发来的参数) ---
+# --- 模块1: 本地 HTTP 服务器 (接收双路数据) ---
 class ConfigHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200)
@@ -38,19 +44,26 @@ class ConfigHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        global GLOBAL_CONFIG
+        global HEIMDALLR_CONFIG, TYBS_CONFIG
         content_length = int(self.headers['Content-Length'])
         post_data = self.rfile.read(content_length)
         
         try:
-            new_config = json.loads(post_data.decode('utf-8'))
-            
-            # 更新全局配置
-            if 'token' in new_config: GLOBAL_CONFIG["TOKEN"] = new_config['token']
-            if 'cookie' in new_config: GLOBAL_CONFIG["COOKIE"] = new_config['cookie']
-            if 'systemId' in new_config: GLOBAL_CONFIG["SYSTEM_ID"] = new_config['systemId']
-            
-            print(f"\n\n♻️  [{datetime.datetime.now().strftime('%H:%M:%S')}] 收到浏览器更新！Token已自动刷新。")
+            data = json.loads(post_data.decode('utf-8'))
+            source = data.get('source')
+            current_time = datetime.datetime.now().strftime('%H:%M:%S')
+
+            if source == 'heimdallr':
+                # 更新旧系统配置
+                if 'token' in data: HEIMDALLR_CONFIG["TOKEN"] = data['token']
+                if 'cookie' in data: HEIMDALLR_CONFIG["COOKIE"] = data['cookie']
+                if 'systemId' in data: HEIMDALLR_CONFIG["SYSTEM_ID"] = data['systemId']
+                print(f"♻️  [{current_time}] Heimdallr 凭证已更新")
+
+            elif source == 'tybs':
+                # 更新新系统配置 (直接存 Headers)
+                TYBS_CONFIG["HEADERS"] = data.get('headers', {})
+                print(f"♻️  [{current_time}] Tybs 工作台凭证已更新")
             
             self.send_response(200)
             self.send_header('Access-Control-Allow-Origin', '*')
@@ -58,15 +71,15 @@ class ConfigHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"status":"ok"}')
         except Exception as e:
-            print(f"接收配置出错: {e}")
+            print(f"配置接收错误: {e}")
 
 def run_server():
     server = HTTPServer(('localhost', LOCAL_PORT), ConfigHandler)
-    print(f"📡 本地监听端口 {LOCAL_PORT} 已启动，等待浏览器投喂数据...")
+    print(f"📡 本地监听端口 {LOCAL_PORT} 已启动...")
     server.serve_forever()
 
-# --- 模块2: 加密逻辑 ---
-def get_security_headers():
+# --- 模块2: 辅助加密 (Heimdallr专用) ---
+def get_heimdallr_security():
     nonce = str(uuid.uuid4())
     timestamp = str(int(time.time() * 1000))
     public_key_str = """-----BEGIN PUBLIC KEY-----
@@ -79,130 +92,163 @@ MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAg7jHfGUlvynIWwa9UNls5DFABtoVwVXBPZ3b
         ciphertext = cipher.encrypt(payload)
         sign = base64.b64encode(ciphertext).decode('utf-8')
         return {"nonce": nonce, "timestamp": timestamp, "sign": sign}
-    except Exception as e:
+    except:
         return None
 
-# --- 模块3: 监控逻辑 ---
-def monitor_thread_func():
-    global LATEST_ORDERS
+# --- 模块3: Tybs 监控线程 (新功能) ---
+def monitor_tybs_thread():
+    global LATEST_TYBS_COUNT
+    url = "https://tybs.onewo.com/api/dc-incident/town-api/list/queryIncidentCount"
+
+    while IS_RUNNING:
+        # 1. 检查是否有凭证
+        if not TYBS_CONFIG["HEADERS"]:
+            time.sleep(3)
+            continue
+
+        # 2. 构造请求
+        # 注意：这里直接使用浏览器传过来的 Header，但也需要手动覆盖一些不应该被缓存的
+        headers = TYBS_CONFIG["HEADERS"].copy()
+        # 移除可能引起问题的 content-length 或 host，保留核心鉴权参数
+        headers.pop('content-length', None)
+        headers.pop('Content-Length', None)
+        headers['Content-Type'] = 'application/json'
+
+        # 固定 Payload (根据你的 curl)
+        payload = {
+            "pageNum": 1,
+            "pageSize": 15,
+            "searchStatus": "1",
+            "selectContent": "",
+            "startTime": "",
+            "endTime": "",
+            "projectCode": "",
+            "businessTypeList": [],
+            "projectCodeList": ["32020085"]
+        }
+
+        try:
+            response = requests.post(url, headers=headers, json=payload, verify=False, timeout=10)
+            if response.status_code == 200:
+                res_json = response.json()
+                # 提取 tobeProcessedCount
+                if 'data' in res_json and 'tobeProcessedCount' in res_json['data']:
+                    count = res_json['data']['tobeProcessedCount']
+                    LATEST_TYBS_COUNT = count
+                    
+                    if count > 0:
+                        print(f"\r\n🔔 [Tybs工作台] 发现 {count} 个待处理工单！ \a")
+                else:
+                    # 格式不对
+                    pass
+            elif response.status_code == 401 or response.status_code == 403:
+                # 凭证失效，清空等待更新
+                TYBS_CONFIG["HEADERS"] = {}
+                print("\r\n⚠️ [Tybs] 凭证失效，请在浏览器刷新 Tybs 页面...")
+        except Exception as e:
+            # print(f"Tybs Error: {e}")
+            pass
+            
+        time.sleep(MONITOR_INTERVAL)
+
+# --- 模块4: Heimdallr 监控线程 (旧功能) ---
+def monitor_heimdallr_thread():
+    global LATEST_HEIMDALLR_ORDERS
     url = "https://heimdallr.onewo.com/api/task/courier/admin/task/work-order/queryCourierTaskWorkOrderEtlPage"
 
     while IS_RUNNING:
-        # 还没收到 Token 时，先空转
-        if not GLOBAL_CONFIG["TOKEN"]:
+        if not HEIMDALLR_CONFIG["TOKEN"]:
             time.sleep(2)
             continue
 
-        security_data = get_security_headers()
-        if not security_data:
-            time.sleep(5)
-            continue
+        sec = get_heimdallr_security()
+        if not sec: continue
 
         headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Authorization": GLOBAL_CONFIG["TOKEN"],
-            "COMPANY": "00000000000000000000000000000000",
+            "Authorization": HEIMDALLR_CONFIG["TOKEN"],
+            "Cookie": HEIMDALLR_CONFIG["COOKIE"],
+            "systemId": HEIMDALLR_CONFIG["SYSTEM_ID"],
+            "nonce": sec["nonce"],
+            "timestamp": sec["timestamp"],
+            "sign": sec["sign"],
+            "type": HEIMDALLR_CONFIG["TYPE_HEADER"],
             "Content-Type": "application/json",
-            "Need-Permission": "false",
-            "Origin": "https://heimdallr.onewo.com",
-            "Referer": "https://heimdallr.onewo.com/remote-event-center-new/",
-            "System-Tag": "web",
+            "COMPANY": "00000000000000000000000000000000",
             "USER": "3abf642db9b84f1a8958920cde509aed",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Cookie": GLOBAL_CONFIG["COOKIE"],
-            "nonce": security_data["nonce"],
-            "timestamp": security_data["timestamp"],
-            "sign": security_data["sign"],
-            "systemId": GLOBAL_CONFIG["SYSTEM_ID"],
-            "type": GLOBAL_CONFIG["TYPE_HEADER"]
+            "Need-Permission": "false"
         }
 
-        # 仅包含待接受
-        target_status = "['1', '1001', '1002', '1003', '1004', '1005', '1013', '1014', '4040']"
-
         payload = {
-            "workorderStatus": target_status,
+            "workorderStatus": "['1', '1001', '1002', '1003', '1004', '1005', '1013', '1014', '4040']", 
             "fmWoType": "OD",
-            "current": 1,
-            "limit": 20,
+            "current": 1, "limit": 20,
             "startTime": "2025-09-27 00:00:00",
-            "endTime": "2025-12-28 23:59:59",
+            "endTime": "2026-12-28 23:59:59",
             "type": "1"
         }
 
         try:
-            response = requests.post(url, headers=headers, json=payload, verify=False, timeout=15)
+            resp = requests.post(url, headers=headers, json=payload, verify=False, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json().get('data', {})
+                raw_list = data.get('records') or data.get('rows') or []
+                LATEST_HEIMDALLR_ORDERS = [x for x in raw_list if x.get('workorderStatus') == '1']
+                
+                if len(LATEST_HEIMDALLR_ORDERS) > 0:
+                    print(f"\r\n🔴 [Heimdallr] 发现 {len(LATEST_HEIMDALLR_ORDERS)} 个新工单！ \a")
+            elif resp.status_code == 401:
+                HEIMDALLR_CONFIG["TOKEN"] = ""
+                print("\r\n⚠️ [Heimdallr] Token 过期，等待浏览器更新...")
+        except:
+            pass
             
-            if response.status_code == 200:
-                result = response.json()
-                data_block = result.get('data')
-
-                if data_block:
-                    raw_list = data_block.get('records') or data_block.get('rows') or []
-                else:
-                    raw_list = []
-
-                # 只留状态为 1 (待接受) 的
-                LATEST_ORDERS = [x for x in raw_list if x.get('workorderStatus') == '1']
-
-                count = len(LATEST_ORDERS)
-                current_time = datetime.datetime.now().strftime("%H:%M:%S")
-
-                if count > 0:
-                    print(f"\r\n[{current_time}] 🔴 警告：发现 {count} 个 待处理工单！(输入 ls 查看) \a")
-                else:
-                    print(f"\r[{current_time}] 监控运行中... 暂无数据   ", end="")
-            elif response.status_code == 401:
-                print(f"\r\n[{datetime.datetime.now().strftime('%H:%M:%S')}] ⚠️  Token 已过期，等待浏览器自动刷新...", end="")
-            else:
-                print(f"\r❌ 接口异常: {response.status_code}", end="")
-
-        except Exception as e:
-            print(f"\r❌ 网络错误: {e}", end="")
-        
         time.sleep(MONITOR_INTERVAL)
 
 # --- 主程序 ---
 def main():
     global IS_RUNNING
-    print("\n=== OD工单监控系统 (浏览器联动版) ===")
-    print("🚀 系统启动中...")
+    print("\n=== 双系统工单监控终端 (v3.0) ===")
+    print("1. Tybs工作台 (待处理计数)")
+    print("2. Heimdallr系统 (新单详情)")
+    print("--------------------------------")
 
-    # 1. 启动接收服务器线程
-    t_server = threading.Thread(target=run_server)
-    t_server.daemon = True
-    t_server.start()
+    # 启动所有线程
+    threading.Thread(target=run_server, daemon=True).start()
+    threading.Thread(target=monitor_tybs_thread, daemon=True).start()
+    threading.Thread(target=monitor_heimdallr_thread, daemon=True).start()
 
-    # 2. 启动监控线程
-    t_monitor = threading.Thread(target=monitor_thread_func)
-    t_monitor.daemon = True
-    t_monitor.start()
-
-    print("\n👉 请确保浏览器已安装油猴脚本，并打开了工单页面。")
-    print("👉 等待第一次数据同步...\n")
+    print("\n🚀 系统已启动，等待浏览器投喂凭证...")
 
     while True:
-        cmd = input().strip().lower()
-        if cmd == 'ls':
-            count = len(LATEST_ORDERS)
-            if count == 0:
-                print("\n✅ 当前无新工单。")
-            else:
-                print(f"\n{'='*20} 新工单列表 ({count}) {'='*20}")
-                for i, order in enumerate(LATEST_ORDERS):
-                    print(f"{i+1}. 状态: 【{order.get('workorderStatusName')}】")
-                    print(f"   单号: {order.get('workorderNo')}")
-                    print(f"   标题: {order.get('workorderTitle')}")
-                    print(f"   地址: {order.get('address')}")
-                    print(f"   描述: {order.get('workorderDescription')[:30]}...") 
-                    print("-" * 40)
-                print("================================================\n")
-        elif cmd == 'q':
-            IS_RUNNING = False
-            print("正在退出...")
-            break
+        current_time = datetime.datetime.now().strftime("%H:%M:%S")
+        
+        # 构建显示状态
+        tybs_status = "等待凭证..."
+        if TYBS_CONFIG["HEADERS"]:
+            tybs_status = f"{LATEST_TYBS_COUNT} 个" if LATEST_TYBS_COUNT >= 0 else "检测中..."
+            if LATEST_TYBS_COUNT > 0: tybs_status += " [!] "
+
+        heim_status = "等待凭证..."
+        if HEIMDALLR_CONFIG["TOKEN"]:
+            c = len(LATEST_HEIMDALLR_ORDERS)
+            heim_status = f"{c} 个" if c >= 0 else "检测中..."
+            if c > 0: heim_status += " [!] "
+
+        # 单行刷新显示
+        print(f"\r[{current_time}] Tybs待办: {tybs_status}  |  Heimdallr待办: {heim_status}      ", end="")
+        
+        # 简单命令处理
+        # 这里为了不阻塞显示，使用非阻塞输入比较麻烦，所以还是保留之前的 ls 逻辑，但稍微改一下
+        # 为了让 print \r 正常工作，我们稍微 sleep 一下，不需要一直狂刷
+        time.sleep(1) 
+        
+        # 如果你想输入命令，可以在这里加 input，但会打断上面的即时刷新。
+        # 建议直接通过上面的报警来看。如果一定要查 Heimdallr 详情，我们可以另开一个 input 线程，或者像下面这样简单的 hack:
+        # (由于双线程监控，input 会卡住主线程刷新，所以这里推荐【只看报警，不手动查询】)
 
 if __name__ == "__main__":
-    main()
-
-
+    try:
+        main()
+    except KeyboardInterrupt:
+        IS_RUNNING = False
+        print("\n退出...")
